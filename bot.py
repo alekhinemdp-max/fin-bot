@@ -15,6 +15,8 @@ from telegram.ext import (
 from handlers.transaction import handle_text_transaction
 from handlers.voice import handle_voice_transaction
 from handlers.report import handle_report_command, handle_report_text
+from utils.reset import handle_reset_ask, handle_reset_callback
+from handlers.transaction import handle_undo_callback
 from utils.db import init_db
 
 logging.basicConfig(
@@ -84,6 +86,11 @@ def main():
     app.add_handler(CommandHandler("stats", handle_report_command))
     app.add_handler(CommandHandler("last", handle_report_command))
     app.add_handler(CommandHandler("undo", handle_report_command))
+    app.add_handler(CommandHandler("reset", handle_reset_ask))
+    
+    from telegram.ext import CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(handle_undo_callback, pattern="^undo_"))
+    app.add_handler(CallbackQueryHandler(handle_reset_callback, pattern="^reset_"))
     
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO,
