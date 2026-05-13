@@ -1,4 +1,4 @@
-"""База данных PostgreSQL — для Railway/Render деплоя"""
+"""База данных PostgreSQL"""
 
 import os
 import psycopg2
@@ -20,6 +20,7 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Транзакции
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
                     id          SERIAL PRIMARY KEY,
@@ -34,19 +35,41 @@ def init_db():
                 )
             """)
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_date 
+                CREATE INDEX IF NOT EXISTS idx_user_date
                 ON transactions(user_id, created_at)
+            """)
+            # Бюджеты
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS budgets (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     BIGINT NOT NULL,
+                    category    TEXT NOT NULL,
+                    amount      NUMERIC(15, 2) NOT NULL,
+                    currency    TEXT NOT NULL DEFAULT 'ARS',
+                    created_at  TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, category)
+                )
+            """)
+            # Настройки пользователя (включён ли бюджет)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id         BIGINT PRIMARY KEY,
+                    budgets_enabled BOOLEAN DEFAULT FALSE,
+                    onboarded       BOOLEAN DEFAULT FALSE,
+                    created_at      TIMESTAMP DEFAULT NOW()
+                )
             """)
         conn.commit()
 
+
+# ── Транзакции ────────────────────────────────────────────────────────────────
 
 def save_transaction(user_id, tx_type, amount, currency, category, description, raw_text):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO transactions (user_id, type, amount, currency, category, description, raw_text)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
             """, (user_id, tx_type, amount, currency, category, description, raw_text))
             row = cur.fetchone()
         conn.commit()
@@ -103,3 +126,88 @@ def get_last_n(user_id, n=10):
             rows = cur.fetchall()
     return [(r["id"], r["type"], float(r["amount"]), r["currency"],
              r["category"], r["description"], r["created_at"]) for r in rows]
+
+
+# ── Бюджеты ───────────────────────────────────────────────────────────────────
+
+def set_budget(user_id, category, amount, currency="ARS"):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO budgets (user_id, category, amount, currency)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, category)
+                DO UPDATE SET amount = EXCLUDED.amount, currency = EXCLUDED.currency
+            """, (user_id, category, amount, currency))
+        conn.commit()
+
+
+def get_budgets(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT category, amount::float, currency
+                FROM budgets WHERE user_id = %s ORDER BY category
+            """, (user_id,))
+            rows = cur.fetchall()
+    return [(r["category"], float(r["amount"]), r["currency"]) for r in rows]
+
+
+def delete_budget(user_id, category):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM budgets WHERE user_id = %s AND category = %s", (user_id, category))
+        conn.commit()
+
+
+def get_month_spent(user_id, category, currency="ARS"):
+    """Сколько потрачено в текущем месяце по категории"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(amount), 0)::float as total
+                FROM transactions
+                WHERE user_id = %s
+                  AND type = 'expense'
+                  AND category = %s
+                  AND currency = %s
+                  AND date_trunc('month', created_at) = date_trunc('month', NOW())
+            """, (user_id, category, currency))
+            row = cur.fetchone()
+    return float(row["total"]) if row else 0.0
+
+
+# ── Настройки ─────────────────────────────────────────────────────────────────
+
+def get_user_settings(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def set_user_settings(user_id, budgets_enabled=None, onboarded=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_settings (user_id, budgets_enabled, onboarded)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    budgets_enabled = COALESCE(EXCLUDED.budgets_enabled, user_settings.budgets_enabled),
+                    onboarded = COALESCE(EXCLUDED.onboarded, user_settings.onboarded)
+            """, (user_id,
+                  budgets_enabled if budgets_enabled is not None else False,
+                  onboarded if onboarded is not None else False))
+        conn.commit()
+
+
+def update_user_setting(user_id, field, value):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO user_settings (user_id, {field})
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET {field} = EXCLUDED.{field}
+            """, (user_id, value))
+        conn.commit()
