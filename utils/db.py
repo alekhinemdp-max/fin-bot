@@ -279,3 +279,34 @@ def update_user_setting(user_id, field, value):
                 ON CONFLICT (user_id) DO UPDATE SET {field} = EXCLUDED.{field}
             """, (user_id, value))
         conn.commit()
+
+
+# ── Язык пользователя ─────────────────────────────────────────────────────────
+
+def init_language_table():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                ALTER TABLE user_settings
+                ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'
+            """)
+        conn.commit()
+
+
+def get_user_language(user_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT language FROM user_settings WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    return row["language"] if row and row.get("language") else "ru"
+
+
+def set_user_language(user_id: int, lang: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_settings (user_id, language)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET language = EXCLUDED.language
+            """, (user_id, lang))
+        conn.commit()
