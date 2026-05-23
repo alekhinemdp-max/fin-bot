@@ -6,13 +6,23 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+DEFAULT_CATEGORIES_EXPENSE = [
+    "Еда и продукты", "Кафе и рестораны", "Транспорт", "Такси",
+    "Коммунальные услуги", "Связь и интернет", "Одежда",
+    "Здоровье и аптека", "Развлечения", "Образование",
+    "Путешествия", "Дом и ремонт", "Техника", "Подарки",
+    "Бизнес-расходы", "Прочее"
+]
+
+DEFAULT_CATEGORIES_INCOME = [
+    "Зарплата", "Фриланс", "Бизнес", "Аренда",
+    "Инвестиции", "Подарок", "Возврат долга", "Прочее"
+]
+
 
 def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError(
-            "❌ Переменная DATABASE_URL не задана!\n"
-            "На Railway: добавь PostgreSQL сервис — переменная появится автоматически."
-        )
+        raise RuntimeError("❌ DATABASE_URL не задана!")
     url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
@@ -20,7 +30,6 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Транзакции
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
                     id          SERIAL PRIMARY KEY,
@@ -34,29 +43,35 @@ def init_db():
                     created_at  TIMESTAMP DEFAULT NOW()
                 )
             """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_date
-                ON transactions(user_id, created_at)
-            """)
-            # Бюджеты
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON transactions(user_id, created_at)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS budgets (
-                    id          SERIAL PRIMARY KEY,
-                    user_id     BIGINT NOT NULL,
-                    category    TEXT NOT NULL,
-                    amount      NUMERIC(15, 2) NOT NULL,
-                    currency    TEXT NOT NULL DEFAULT 'ARS',
-                    created_at  TIMESTAMP DEFAULT NOW(),
+                    id         SERIAL PRIMARY KEY,
+                    user_id    BIGINT NOT NULL,
+                    category   TEXT NOT NULL,
+                    amount     NUMERIC(15, 2) NOT NULL,
+                    currency   TEXT NOT NULL DEFAULT 'ARS',
+                    created_at TIMESTAMP DEFAULT NOW(),
                     UNIQUE(user_id, category)
                 )
             """)
-            # Настройки пользователя (включён ли бюджет)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id         BIGINT PRIMARY KEY,
                     budgets_enabled BOOLEAN DEFAULT FALSE,
                     onboarded       BOOLEAN DEFAULT FALSE,
                     created_at      TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            # Пользовательские категории
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_categories (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    BIGINT NOT NULL,
+                    name       TEXT NOT NULL,
+                    type       TEXT NOT NULL DEFAULT 'expense' CHECK(type IN ('expense', 'income', 'both')),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, name)
                 )
             """)
         conn.commit()
@@ -128,6 +143,61 @@ def get_last_n(user_id, n=10):
              r["category"], r["description"], r["created_at"]) for r in rows]
 
 
+# ── Категории ─────────────────────────────────────────────────────────────────
+
+def get_user_categories(user_id, cat_type=None):
+    """Возвращает пользовательские категории"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if cat_type:
+                cur.execute("""
+                    SELECT name, type FROM user_categories
+                    WHERE user_id = %s AND (type = %s OR type = 'both')
+                    ORDER BY name
+                """, (user_id, cat_type))
+            else:
+                cur.execute("""
+                    SELECT name, type FROM user_categories
+                    WHERE user_id = %s ORDER BY name
+                """, (user_id,))
+            rows = cur.fetchall()
+    return [(r["name"], r["type"]) for r in rows]
+
+
+def get_all_categories(user_id, cat_type="expense"):
+    """Базовые + пользовательские категории"""
+    user_cats = [name for name, t in get_user_categories(user_id, cat_type)]
+    if cat_type == "expense":
+        base = DEFAULT_CATEGORIES_EXPENSE
+    else:
+        base = DEFAULT_CATEGORIES_INCOME
+    # Пользовательские сначала, потом базовые (без дублей)
+    all_cats = user_cats + [c for c in base if c not in user_cats]
+    return all_cats
+
+
+def add_user_category(user_id, name, cat_type="expense"):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_categories (user_id, name, type)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, name) DO UPDATE SET type = EXCLUDED.type
+            """, (user_id, name, cat_type))
+        conn.commit()
+
+
+def delete_user_category(user_id, name):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM user_categories WHERE user_id = %s AND name = %s
+            """, (user_id, name))
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted > 0
+
+
 # ── Бюджеты ───────────────────────────────────────────────────────────────────
 
 def set_budget(user_id, category, amount, currency="ARS"):
@@ -161,16 +231,13 @@ def delete_budget(user_id, category):
 
 
 def get_month_spent(user_id, category, currency="ARS"):
-    """Сколько потрачено в текущем месяце по категории"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT COALESCE(SUM(amount), 0)::float as total
                 FROM transactions
-                WHERE user_id = %s
-                  AND type = 'expense'
-                  AND category = %s
-                  AND currency = %s
+                WHERE user_id = %s AND type = 'expense'
+                  AND category = %s AND currency = %s
                   AND date_trunc('month', created_at) = date_trunc('month', NOW())
             """, (user_id, category, currency))
             row = cur.fetchone()
@@ -187,7 +254,7 @@ def get_user_settings(user_id):
     return dict(row) if row else None
 
 
-def set_user_settings(user_id, budgets_enabled=None, onboarded=None):
+def set_user_settings(user_id, budgets_enabled=False, onboarded=False):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -196,13 +263,14 @@ def set_user_settings(user_id, budgets_enabled=None, onboarded=None):
                 ON CONFLICT (user_id) DO UPDATE SET
                     budgets_enabled = COALESCE(EXCLUDED.budgets_enabled, user_settings.budgets_enabled),
                     onboarded = COALESCE(EXCLUDED.onboarded, user_settings.onboarded)
-            """, (user_id,
-                  budgets_enabled if budgets_enabled is not None else False,
-                  onboarded if onboarded is not None else False))
+            """, (user_id, budgets_enabled, onboarded))
         conn.commit()
 
 
 def update_user_setting(user_id, field, value):
+    allowed = {"budgets_enabled", "onboarded"}
+    if field not in allowed:
+        return
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(f"""
